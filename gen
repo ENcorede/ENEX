@@ -1,0 +1,966 @@
+"""
+ENEX Telegram bot — Python 3.11+
+Install: pip install -U aiogram aiosqlite pillow
+Run: set BOT_TOKEN and ADMIN_IDS environment variables, then python bot.py
+
+Windows PowerShell:
+  $env:BOT_TOKEN="123:ABC"
+  $env:ADMIN_IDS="123456789,987654321"
+  python bot.py
+
+Enable Inline Mode in @BotFather (/setinline) and set a short placeholder.
+Note: Inline results can show formatted text and buttons. To show generated blue
+image cards in inline results, host the images publicly or upload them once and
+use Telegram file_id; this implementation creates the card image for private
+check/request messages and uses text cards in inline mode.
+"""
+import asyncio
+import logging
+import os
+import re
+import secrets
+import io
+from datetime import datetime, timezone
+
+import aiosqlite
+from PIL import Image, ImageDraw, ImageFont
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    Message, CallbackQuery, InlineQuery, InlineQueryResultArticle,
+    InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice, PreCheckoutQuery, BufferedInputFile, BotCommand, ChosenInlineResult,
+)
+from aiogram.exceptions import TelegramBadRequest
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_BOT_TOKEN_HERE")
+ADMIN_IDS = {5068550043, 6977407005} | {
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+DB_PATH = os.getenv("ENEX_DB_PATH", "enex.sqlite3")
+FEE_PERCENT = 5
+# Stars paid -> ENEX credit mapping. Edit these lots as you like.
+STAR_LOTS = {
+    "lot_1": {"stars": 25, "enex": 250},
+    "lot_2": {"stars": 50, "enex": 550},
+    "lot_3": {"stars": 100, "enex": 1200},
+    "lot_4": {"stars": 250, "enex": 3250},
+}
+BLUE = (35, 105, 235)
+WHITE = (255, 255, 255)
+
+logging.basicConfig(level=logging.INFO)
+dp = Dispatcher()
+bot_username = ""
+
+
+def money(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def blue_card(title: str, amount: int, subtitle: str = "ENEX") -> bytes:
+    """Create a simple blue card image, returned as PNG bytes."""
+    im = Image.new("RGB", (1000, 520), BLUE)
+    d = ImageDraw.Draw(im)
+    try:
+        font_big = ImageFont.truetype("DejaVuSans-Bold.ttf", 82)
+        font_mid = ImageFont.truetype("DejaVuSans-Bold.ttf", 44)
+        font_small = ImageFont.truetype("DejaVuSans.ttf", 30)
+    except OSError:
+        font_big, font_mid, font_small = ImageFont.load_default(), ImageFont.load_default(), ImageFont.load_default()
+    # Decorative soft circles, no external assets needed.
+    d.ellipse((760, -140, 1130, 230), fill=(48, 122, 250))
+    d.ellipse((-120, 370, 180, 670), fill=(28, 91, 210))
+    d.text((65, 62), "ENEX", font=font_mid, fill=WHITE)
+    d.text((65, 170), title, font=font_small, fill=(224, 237, 255))
+    d.text((65, 230), money(amount), font=font_big, fill=WHITE)
+    d.text((70, 390), subtitle, font=font_mid, fill=WHITE)
+    out = io.BytesIO()
+    im.save(out, format="PNG")
+    return out.getvalue()
+
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY, username TEXT, first_name TEXT,
+            balance INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
+            transfers_enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS transactions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL, amount INTEGER NOT NULL, details TEXT,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS checks(
+            token TEXT PRIMARY KEY, creator_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL, remaining INTEGER NOT NULL,
+            max_claims INTEGER NOT NULL DEFAULT 1, claims INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS requests(
+            token TEXT PRIMARY KEY, creator_id INTEGER NOT NULL,
+            target_id INTEGER, amount INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open', created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS payments(
+            charge_id TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
+            stars INTEGER NOT NULL, enex INTEGER NOT NULL, created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS promos(
+            code TEXT PRIMARY KEY, amount INTEGER NOT NULL,
+            max_uses INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1, created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )""")
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS promo_uses(
+            code TEXT NOT NULL, user_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL, PRIMARY KEY(code, user_id)
+        )""")
+        await db.commit()
+
+
+async def register_user(user):
+    if not user:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT INTO users(user_id, username, first_name, created_at)
+        VALUES(?,?,?,?)
+        ON CONFLICT(user_id) DO UPDATE SET username=excluded.username,
+          first_name=excluded.first_name
+        """, (user.id, (user.username or "").lower(), user.first_name or "",
+              datetime.now(timezone.utc).isoformat()))
+        await db.commit()
+
+
+async def get_user(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM users WHERE user_id=?", (user_id,))
+        return await cur.fetchone()
+
+
+async def find_username(username: str):
+    username = username.lstrip("@").lower()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM users WHERE username=? AND active=1", (username,))
+        return await cur.fetchone()
+
+
+async def log_tx(db, user_id, kind, amount, details=""):
+    await db.execute(
+        "INSERT INTO transactions(user_id,kind,amount,details,created_at) VALUES(?,?,?,?,?)",
+        (user_id, kind, amount, details, datetime.now(timezone.utc).isoformat())
+    )
+
+
+def main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Баланс", callback_data="menu:balance"),
+         InlineKeyboardButton(text="🔄 Перевести", callback_data="menu:transfer")],
+        [InlineKeyboardButton(text="⭐ Пополнить ENEX", callback_data="menu:topup"),
+         InlineKeyboardButton(text="🧾 Чек", callback_data="menu:check")],
+        [InlineKeyboardButton(text="💸 Запросить деньги", callback_data="menu:request"),
+         InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu:settings")],
+        [InlineKeyboardButton(text="❔ Помощь", callback_data="menu:help")]
+    ])
+
+
+def settings_keyboard(enabled: bool):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"Переводы: {'🟢 включены' if enabled else '🔴 выключены'}",
+            callback_data="settings:toggle")],
+        [InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")]
+    ])
+
+
+async def send_card(message: Message, title: str, amount: int, caption: str, markup=None):
+    data = blue_card(title, amount)
+    await message.answer_photo(BufferedInputFile(data, filename="enex-card.png"),
+                               caption=caption, reply_markup=markup)
+
+
+@dp.message(CommandStart())
+async def start(message: Message, command: CommandStart):
+    await register_user(message.from_user)
+    arg = command.args or ""
+    if arg.startswith("claim_"):
+        await claim_check(message, arg[6:])
+        return
+    if arg.startswith("payreq_"):
+        await accept_request(message, arg[7:])
+        return
+    u = await get_user(message.from_user.id)
+    await message.answer(
+        f"🔷 <b>ENEX</b>\n\n"
+        f"Твоя цифровая валюта в Telegram.\n"
+        f"Баланс: <b>{money(u['balance'])} ENEX</b>\n\n"
+        f"Выбери действие в меню или используй inline-режим: "
+        f"<code>@{bot_username} check 100</code> / "
+        f"<code>@{bot_username} request 100</code>.",
+        reply_markup=main_keyboard(), parse_mode="HTML"
+    )
+
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    await register_user(message.from_user)
+    await message.answer(
+        "<b>ENEX — команды</b>\n\n"
+        "/balance — баланс\n"
+        "/transfer @username 100 — перевод (комиссия 5%)\n"
+        "/check 100 — создать чек на одного получателя\n"
+        "/request 100 — создать запрос денег\n"
+        "/settings — настройки переводов\n"
+        "/topup — купить ENEX за Telegram Stars\n\n"
+        f"Inline: <code>@{bot_username} check 100</code> или "
+        f"<code>@{bot_username} request 100</code> в любом чате.\n"
+        "Получатель должен хотя бы один раз запустить бота.",
+        parse_mode="HTML", reply_markup=main_keyboard()
+    )
+    if message.from_user.id in ADMIN_IDS:
+        await message.answer(
+            "🛡 <b>Команды администрации</b>\n"
+            "/admin_give @username СУММА — выдать ENEX\n"
+            "/admin_giveall СУММА — выдать всем\n"
+            "/admin_msg @username ТЕКСТ — написать в ЛС\n"
+            "/admin_broadcast ТЕКСТ — рассылка всем\n"
+            "/promo_create КОД СУММА АКТИВАЦИИ — создать промокод\n"
+            "/promo_delete КОД — удалить промокод\n"
+            "/admin_balance ID — баланс\n/admin_add ID СУММА — начислить\n"
+            "/admin_sub ID СУММА — списать\n/admin_block ID — блокировка",
+            parse_mode="HTML")
+
+
+@dp.message(Command("balance"))
+async def balance_cmd(message: Message):
+    await register_user(message.from_user)
+    u = await get_user(message.from_user.id)
+    await message.answer(f"💳 Баланс: <b>{money(u['balance'])} ENEX</b>",
+                         parse_mode="HTML", reply_markup=main_keyboard())
+
+
+@dp.message(Command("settings"))
+async def settings_cmd(message: Message):
+    await register_user(message.from_user)
+    u = await get_user(message.from_user.id)
+    await message.answer("⚙️ <b>Настройки ENEX</b>\nРазрешить другим пользователям переводить тебе ENEX?",
+                         parse_mode="HTML",
+                         reply_markup=settings_keyboard(bool(u["transfers_enabled"])))
+
+
+@dp.message(Command("topup"))
+async def topup_cmd(message: Message):
+    await register_user(message.from_user)
+    await show_lots(message)
+
+
+async def show_lots(message: Message):
+    rows = []
+    for lot_id, lot in STAR_LOTS.items():
+        rows.append([InlineKeyboardButton(
+            text=f"⭐ {lot['stars']} Stars → {money(lot['enex'])} ENEX",
+            callback_data=f"buy:{lot_id}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")])
+    await message.answer("⭐ <b>Пополнение ENEX</b>\nВыбери лот. Оплата проходит через Telegram Stars.",
+                         parse_mode="HTML",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.message(Command("transfer"))
+async def transfer_cmd(message: Message):
+    await register_user(message.from_user)
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].startswith("@") or not parts[2].isdigit():
+        await message.answer("Формат: <code>/transfer @username 100</code>", parse_mode="HTML")
+        return
+    await do_transfer(message, parts[1], int(parts[2]))
+
+
+async def do_transfer(message: Message, username: str, amount: int):
+    sender_id = message.from_user.id
+    if amount <= 0:
+        await message.answer("Сумма должна быть больше нуля.")
+        return
+    recipient = await find_username(username)
+    if not recipient:
+        await message.answer("Не нашёл активного пользователя. Он должен запустить бота и иметь username.")
+        return
+    if recipient["user_id"] == sender_id:
+        await message.answer("Нельзя перевести ENEX самому себе.")
+        return
+    if not recipient["transfers_enabled"]:
+        await message.answer("У пользователя отключены входящие переводы.")
+        return
+    fee = (amount * FEE_PERCENT + 99) // 100
+    total = amount + fee
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT balance,active FROM users WHERE user_id=?", (sender_id,))
+        sender = await cur.fetchone()
+        if not sender or not sender[1] or sender[0] < total:
+            await db.rollback()
+            await message.answer(f"Недостаточно средств. Нужно {money(total)} ENEX "
+                                 f"(сумма {money(amount)} + комиссия {money(fee)}).")
+            return
+        await db.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (total, sender_id))
+        await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?",
+                         (amount, recipient["user_id"]))
+        await log_tx(db, sender_id, "transfer_out", -total,
+                     f"to={recipient['user_id']};amount={amount};fee={fee}")
+        await log_tx(db, recipient["user_id"], "transfer_in", amount, f"from={sender_id}")
+        await db.commit()
+    await message.answer(
+        f"✅ Перевод выполнен\nПолучатель: @{recipient['username']}\n"
+        f"Отправлено: <b>{money(amount)} ENEX</b>\n"
+        f"Комиссия 5%: {money(fee)} ENEX\nСписано всего: {money(total)} ENEX",
+        parse_mode="HTML")
+
+
+@dp.message(Command("check"))
+async def check_cmd(message: Message):
+    await register_user(message.from_user)
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) <= 0:
+        await message.answer("Формат: <code>/check 100</code>", parse_mode="HTML")
+        return
+    await create_check(message, int(parts[1]))
+
+
+async def create_check(message: Message, amount: int, inline=False):
+    uid = message.from_user.id
+    if amount <= 0:
+        return None
+    token = secrets.token_urlsafe(9).replace("-", "").replace("_", "")[:12]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+        if not row or row[0] < amount:
+            await db.rollback()
+            if not inline:
+                await message.answer("Недостаточно ENEX для создания чека.")
+            return None
+        await db.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (amount, uid))
+        await db.execute(
+            "INSERT INTO checks(token,creator_id,amount,remaining,created_at) VALUES(?,?,?,?,?)",
+            (token, uid, amount, amount, datetime.now(timezone.utc).isoformat()))
+        await log_tx(db, uid, "check_create", -amount, f"token={token}")
+        await db.commit()
+    return token
+
+
+async def claim_check(message: Message, token: str):
+    await register_user(message.from_user)
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM checks WHERE token=?", (token,))
+        check = await cur.fetchone()
+        if not check or check["status"] != "open" or check["remaining"] <= 0:
+            await db.rollback()
+            await message.answer("Этот чек уже закрыт или не существует.")
+            return
+        if check["creator_id"] == uid:
+            await db.rollback()
+            await message.answer("Нельзя активировать собственный чек.")
+            return
+        # Single-use check: all amount goes to the first claimant.
+        await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?",
+                         (check["remaining"], uid))
+        await db.execute("UPDATE checks SET remaining=0,claims=claims+1,status='claimed' WHERE token=?",
+                         (token,))
+        await log_tx(db, uid, "check_claim", check["remaining"], f"token={token}")
+        await db.commit()
+        amount = check["remaining"]
+    await message.answer(f"🎉 Чек активирован! На баланс зачислено <b>{money(amount)} ENEX</b>.",
+                         parse_mode="HTML")
+
+
+@dp.message(Command("request"))
+async def request_cmd(message: Message):
+    await register_user(message.from_user)
+    parts = (message.text or "").split()
+    if len(parts) not in (2, 3) or not parts[1].isdigit() or int(parts[1]) <= 0:
+        await message.answer("Формат: <code>/request 100</code> или <code>/request 100 @username</code>",
+                             parse_mode="HTML")
+        return
+    amount = int(parts[1])
+    target_id = None
+    if len(parts) == 3:
+        target = await find_username(parts[2])
+        if not target:
+            await message.answer("Пользователь не найден или не запускал бота.")
+            return
+        target_id = target["user_id"]
+    token = secrets.token_urlsafe(9).replace("-", "").replace("_", "")[:12]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO requests(token,creator_id,target_id,amount,created_at) VALUES(?,?,?,?,?)",
+            (token, message.from_user.id, target_id, amount, datetime.now(timezone.utc).isoformat()))
+        await db.commit()
+    link = f"https://t.me/{bot_username}?start=payreq_{token}"
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"💸 Оплатить {money(amount)} ENEX", url=link)]
+    ])
+    await send_card(message, "ЗАПРОС ДЕНЕГ", amount,
+                    f"💸 Запрос на <b>{money(amount)} ENEX</b>\n"
+                    f"От: {message.from_user.full_name}\n"
+                    "Нажми кнопку, чтобы открыть оплату в боте.",
+                    markup)
+
+
+async def accept_request(message: Message, token: str):
+    await register_user(message.from_user)
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM requests WHERE token=?", (token,))
+        req = await cur.fetchone()
+    if not req or req["status"] != "open":
+        await message.answer("Запрос уже закрыт или не существует.")
+        return
+    if req["creator_id"] == uid:
+        await message.answer("Это твой запрос.")
+        return
+    if req["target_id"] and req["target_id"] != uid:
+        await message.answer("Этот запрос предназначен другому пользователю.")
+        return
+    # Pay the requester through the same 5% transfer fee rules.
+    creator = await get_user(req["creator_id"])
+    if not creator:
+        await message.answer("Автор запроса больше не активен.")
+        return
+    fake_message = message
+    # Use IDs directly, atomically.
+    amount = req["amount"]
+    fee = (amount * FEE_PERCENT + 99) // 100
+    total = amount + fee
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT balance,transfers_enabled,active FROM users WHERE user_id=?", (uid,))
+        payer = await cur.fetchone()
+        cur = await db.execute("SELECT active FROM users WHERE user_id=?", (req["creator_id"],))
+        payee = await cur.fetchone()
+        cur = await db.execute("SELECT status FROM requests WHERE token=?", (token,))
+        status = await cur.fetchone()
+        if (not payer or payer[0] < total or not payer[2] or not payee or not payee[0]
+                or not status or status[0] != "open"):
+            await db.rollback()
+            await message.answer(f"Не удалось оплатить. Проверь баланс: нужно {money(total)} ENEX с комиссией.")
+            return
+        # Recipient's transfer preference applies to incoming transfers.
+        cur = await db.execute("SELECT transfers_enabled FROM users WHERE user_id=?", (req["creator_id"],))
+        setting = await cur.fetchone()
+        if not setting or not setting[0]:
+            await db.rollback()
+            await message.answer("У автора запроса отключены входящие переводы.")
+            return
+        await db.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (total, uid))
+        await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, req["creator_id"]))
+        await db.execute("UPDATE requests SET status='paid' WHERE token=?", (token,))
+        await log_tx(db, uid, "request_paid", -total, f"token={token};fee={fee}")
+        await log_tx(db, req["creator_id"], "request_received", amount, f"token={token}")
+        await db.commit()
+    await message.answer(f"✅ Запрос оплачен. Списано {money(total)} ENEX, включая комиссию {money(fee)}.")
+
+
+@dp.callback_query(F.data.startswith("menu:"))
+async def menu_callback(call: CallbackQuery):
+    await register_user(call.from_user)
+    action = call.data.split(":", 1)[1]
+    if action == "home":
+        await call.message.edit_text("🔷 <b>ENEX</b>\nВыбери действие:", parse_mode="HTML",
+                                    reply_markup=main_keyboard())
+    elif action == "balance":
+        u = await get_user(call.from_user.id)
+        await call.message.edit_text(f"💳 <b>Твой баланс</b>\n\n{money(u['balance'])} ENEX",
+                                     parse_mode="HTML", reply_markup=main_keyboard())
+    elif action == "topup":
+        await call.message.edit_text("⭐ <b>Пополнение ENEX</b>\nВыбери лот:",
+                                     parse_mode="HTML",
+                                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                         [InlineKeyboardButton(
+                                             text=f"⭐ {v['stars']} Stars → {money(v['enex'])} ENEX",
+                                             callback_data=f"buy:{k}")]
+                                         for k, v in STAR_LOTS.items()
+                                     ] + [[InlineKeyboardButton(text="⬅️ Меню", callback_data="menu:home")]]))
+    elif action == "settings":
+        u = await get_user(call.from_user.id)
+        await call.message.edit_text("⚙️ <b>Настройки</b>\nРазрешить входящие переводы?",
+                                     parse_mode="HTML",
+                                     reply_markup=settings_keyboard(bool(u["transfers_enabled"])))
+    elif action == "transfer":
+        await call.message.answer("Для перевода напиши:\n<code>/transfer @username 100</code>",
+                                  parse_mode="HTML")
+    elif action == "check":
+        await call.message.answer("Создать чек: <code>/check 100</code>\n"
+                                  "Чек можно отправить в любой чат через inline: "
+                                  f"<code>@{bot_username} check 100</code>", parse_mode="HTML")
+    elif action == "request":
+        await call.message.answer("Запросить деньги: <code>/request 100</code>\n"
+                                  "Можно указать адресата: <code>/request 100 @username</code>",
+                                  parse_mode="HTML")
+    elif action == "help":
+        await call.message.answer(
+            f"Inline в любом чате: <code>@{bot_username} check 100</code> или "
+            f"<code>@{bot_username} request 100</code>.\n"
+            "Перевод: /transfer @username 100. Комиссия — 5%.",
+            parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "settings:toggle")
+async def toggle_settings(call: CallbackQuery):
+    await register_user(call.from_user)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET transfers_enabled=1-transfers_enabled WHERE user_id=?",
+                         (call.from_user.id,))
+        await db.commit()
+    u = await get_user(call.from_user.id)
+    await call.message.edit_reply_markup(reply_markup=settings_keyboard(bool(u["transfers_enabled"])))
+    await call.answer("Настройки сохранены")
+
+
+@dp.callback_query(F.data.startswith("buy:"))
+async def buy_lot(call: CallbackQuery):
+    lot_id = call.data.split(":", 1)[1]
+    lot = STAR_LOTS.get(lot_id)
+    if not lot:
+        await call.answer("Лот не найден", show_alert=True)
+        return
+    await bot.send_invoice(
+        chat_id=call.from_user.id,
+        title=f"{money(lot['enex'])} ENEX",
+        description=f"Пополнение внутреннего баланса ENEX на {money(lot['enex'])}.",
+        payload=f"enex:{lot_id}:{call.from_user.id}",
+        currency="XTR",
+        prices=[LabeledPrice(label=f"{money(lot['enex'])} ENEX", amount=lot["stars"])],
+        provider_token=""
+    )
+    await call.answer("Счёт создан")
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    try:
+        payload = query.invoice_payload.split(":")
+        if len(payload) != 3 or payload[0] != "enex" or int(payload[2]) != query.from_user.id:
+            await query.answer(ok=False, error_message="Некорректный счёт.")
+            return
+        lot = STAR_LOTS.get(payload[1])
+        if not lot or query.currency != "XTR" or query.total_amount != lot["stars"]:
+            await query.answer(ok=False, error_message="Данные оплаты не совпали.")
+            return
+        await query.answer(ok=True)
+    except Exception:
+        await query.answer(ok=False, error_message="Не удалось проверить оплату.")
+
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: Message):
+    payment = message.successful_payment
+    parts = payment.invoice_payload.split(":")
+    if len(parts) != 3 or parts[0] != "enex":
+        return
+    lot = STAR_LOTS.get(parts[1])
+    if not lot or int(parts[2]) != message.from_user.id:
+        return
+    charge = payment.telegram_payment_charge_id
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT charge_id FROM payments WHERE charge_id=?", (charge,))
+        if await cur.fetchone():
+            await db.rollback()
+            await message.answer("Этот платёж уже был обработан.")
+            return
+        await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?",
+                         (lot["enex"], message.from_user.id))
+        await db.execute(
+            "INSERT INTO payments(charge_id,user_id,stars,enex,created_at) VALUES(?,?,?,?,?)",
+            (charge, message.from_user.id, payment.total_amount, lot["enex"],
+             datetime.now(timezone.utc).isoformat()))
+        await log_tx(db, message.from_user.id, "stars_topup", lot["enex"],
+                     f"stars={payment.total_amount};charge={charge}")
+        await db.commit()
+    await send_card(message, "ПОПОЛНЕНИЕ УСПЕШНО", lot["enex"],
+                    f"⭐ Оплата принята!\nЗачислено: <b>{money(lot['enex'])} ENEX</b>",
+                    main_keyboard())
+
+
+@dp.inline_query()
+async def inline_query_handler(query: InlineQuery):
+    """Inline query syntax: 'check 100' or 'request 100'. Inline check is a deep-link claim."""
+    await register_user(query.from_user)
+    text = (query.query or "").strip()
+    match = re.fullmatch(r"(check|request)\s+(\d+)", text, re.IGNORECASE)
+    results = []
+    if match:
+        action, raw_amount = match.group(1).lower(), int(match.group(2))
+        if 0 < raw_amount <= 10**9:
+            if action == "check":
+                token = await create_check_inline(query.from_user.id, raw_amount)
+                if token:
+                    link = f"https://t.me/{bot_username}?start=claim_{token}"
+                    content = (f"🔷 ENEX · ЧЕК\n\n💎 Сумма: {money(raw_amount)} ENEX\n"
+                               "🎁 Чек на одного получателя\nНажми кнопку, чтобы забрать.")
+                    markup = InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text=f"🎁 Забрать {money(raw_amount)} ENEX", url=link)]
+                    ])
+                    results.append(InlineQueryResultArticle(
+                        id=f"check_{token}", title=f"🎁 Чек на {money(raw_amount)} ENEX",
+                        description="Создать чек и отправить его в этот чат",
+                        input_message_content=InputTextMessageContent(message_text=content),
+                        reply_markup=markup))
+                else:
+                    results.append(InlineQueryResultArticle(
+                        id="no_funds", title="Недостаточно ENEX",
+                        input_message_content=InputTextMessageContent(
+                            message_text="❌ Недостаточно ENEX для создания чека.")))
+            else:
+                token = await create_request_inline(query.from_user.id, raw_amount)
+                link = f"https://t.me/{bot_username}?start=payreq_{token}"
+                content = (f"🔷 ENEX · ЗАПРОС ДЕНЕГ\n\n💸 Запрошено: {money(raw_amount)} ENEX\n"
+                           f"От: {query.from_user.full_name}")
+                markup = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=f"💸 Оплатить {money(raw_amount)} ENEX", url=link)]
+                ])
+                results.append(InlineQueryResultArticle(
+                    id=f"request_{token}", title=f"💸 Запрос {money(raw_amount)} ENEX",
+                    description="Отправить запрос денег в этот чат",
+                    input_message_content=InputTextMessageContent(message_text=content),
+                    reply_markup=markup))
+    if not results:
+        results = [
+            InlineQueryResultArticle(
+                id="help_check", title="🎁 Создать чек",
+                description="Введите: check 100",
+                input_message_content=InputTextMessageContent(
+                    message_text=f"Чтобы создать чек, введи в inline: @{bot_username} check 100")),
+            InlineQueryResultArticle(
+                id="help_request", title="💸 Запросить деньги",
+                description="Введите: request 100",
+                input_message_content=InputTextMessageContent(
+                    message_text=f"Чтобы создать запрос, введи: @{bot_username} request 100"))
+        ]
+    await query.answer(results, cache_time=0, is_personal=True)
+
+
+async def create_check_inline(user_id: int, amount: int):
+    token = secrets.token_urlsafe(9).replace("-", "").replace("_", "")[:12]
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT balance,active FROM users WHERE user_id=?", (user_id,))
+        row = await cur.fetchone()
+        if not row or not row[1] or row[0] < amount:
+            return None
+        # Pending only: typing an inline query must not charge the user.
+        await db.execute(
+            "INSERT INTO checks(token,creator_id,amount,remaining,status,created_at) VALUES(?,?,?,?,?,?)",
+            (token, user_id, amount, amount, "pending",
+             datetime.now(timezone.utc).isoformat()))
+        await db.commit()
+    return token
+
+
+async def create_request_inline(user_id: int, amount: int):
+    token = secrets.token_urlsafe(9).replace("-", "").replace("_", "")[:12]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO requests(token,creator_id,target_id,amount,created_at) VALUES(?,?,?,?,?)",
+            (token, user_id, None, amount, datetime.now(timezone.utc).isoformat()))
+        await db.commit()
+    return token
+
+
+@dp.chosen_inline_result()
+async def chosen_inline_result_handler(result: ChosenInlineResult):
+    # Enable Inline Feedback in @BotFather (/setinlinefeedback).
+    result_id = result.result_id or ""
+    if not result_id.startswith("check_"):
+        return
+    token = result_id[len("check_"):]
+    uid = result.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT creator_id,amount,status FROM checks WHERE token=?", (token,))
+        row = await cur.fetchone()
+        if not row or row[0] != uid or row[2] != "pending":
+            await db.rollback()
+            return
+        cur = await db.execute("SELECT balance,active FROM users WHERE user_id=?", (uid,))
+        user = await cur.fetchone()
+        if not user or not user[1] or user[0] < row[1]:
+            await db.execute("UPDATE checks SET status='cancelled',remaining=0 WHERE token=?", (token,))
+            await db.commit()
+            return
+        await db.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (row[1], uid))
+        await db.execute("UPDATE checks SET status='open' WHERE token=?", (token,))
+        await log_tx(db, uid, "check_create_inline", -row[1], f"token={token}")
+        await db.commit()
+
+
+@dp.message(Command("promo"))
+async def redeem_promo(message: Message):
+    await register_user(message.from_user)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Формат: /promo КОД")
+        return
+    code = parts[1].strip().upper()
+    uid = message.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM promos WHERE code=?", (code,))
+        promo = await cur.fetchone()
+        if not promo or not promo["active"] or promo["uses"] >= promo["max_uses"]:
+            await db.rollback()
+            await message.answer("❌ Промокод недействителен или активации закончились.")
+            return
+        cur = await db.execute("SELECT 1 FROM promo_uses WHERE code=? AND user_id=?", (code, uid))
+        if await cur.fetchone():
+            await db.rollback()
+            await message.answer("Ты уже активировал этот промокод.")
+            return
+        cur = await db.execute("SELECT active FROM users WHERE user_id=?", (uid,))
+        user = await cur.fetchone()
+        if not user or not user[0]:
+            await db.rollback()
+            await message.answer("Аккаунт недоступен.")
+            return
+        await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (promo["amount"], uid))
+        await db.execute("UPDATE promos SET uses=uses+1 WHERE code=?", (code,))
+        await db.execute("INSERT INTO promo_uses(code,user_id,created_at) VALUES(?,?,?)",
+                          (code, uid, datetime.now(timezone.utc).isoformat()))
+        await log_tx(db, uid, "promo", promo["amount"], f"code={code}")
+        await db.commit()
+    await message.answer(f"🎉 Промокод активирован! Начислено <b>{money(promo['amount'])} ENEX</b>.", parse_mode="HTML")
+
+
+async def admin_only(message: Message) -> bool:
+    if not message.from_user or message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Нет доступа.")
+        return False
+    return True
+
+
+@dp.message(Command("admin_give"))
+async def admin_give_username(message: Message):
+    if not await admin_only(message): return
+    parts = (message.text or "").split()
+    if len(parts) != 3 or not parts[1].startswith("@") or not parts[2].isdigit() or int(parts[2]) <= 0:
+        await message.answer("Формат: /admin_give @username СУММА")
+        return
+    target = await find_username(parts[1])
+    if not target:
+        await message.answer("Пользователь не найден. Он должен запустить бота и иметь username.")
+        return
+    amount = int(parts[2])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, target["user_id"]))
+        await log_tx(db, target["user_id"], "admin_give", amount, f"admin={message.from_user.id}")
+        await db.commit()
+    await message.answer(f"✅ Выдано {money(amount)} ENEX пользователю @{target['username']}.")
+    try: await bot.send_message(target["user_id"], f"🎁 Администрация начислила тебе {money(amount)} ENEX.")
+    except Exception: pass
+
+
+@dp.message(Command("admin_giveall"))
+async def admin_give_all(message: Message):
+    if not await admin_only(message): return
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit() or int(parts[1]) <= 0:
+        await message.answer("Формат: /admin_giveall СУММА")
+        return
+    amount = int(parts[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute("SELECT user_id FROM users WHERE active=1")
+        ids = [r[0] for r in await cur.fetchall()]
+        await db.execute("UPDATE users SET balance=balance+? WHERE active=1", (amount,))
+        for uid in ids: await log_tx(db, uid, "admin_giveall", amount, f"admin={message.from_user.id}")
+        await db.commit()
+    await message.answer(f"✅ Начислено {money(amount)} ENEX пользователям: {len(ids)}.")
+
+
+@dp.message(Command("admin_msg"))
+async def admin_dm_user(message: Message):
+    if not await admin_only(message): return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].startswith("@"):
+        await message.answer("Формат: /admin_msg @username Текст сообщения")
+        return
+    target = await find_username(parts[1])
+    if not target:
+        await message.answer("Пользователь не найден. Он должен запустить бота.")
+        return
+    try:
+        await bot.send_message(target["user_id"], "📩 <b>Сообщение администрации</b>\n\n" + parts[2], parse_mode="HTML")
+        await message.answer("✅ Сообщение отправлено в ЛС бота.")
+    except Exception as e: await message.answer(f"Не удалось отправить сообщение: {e}")
+
+
+@dp.message(Command("admin_broadcast"))
+async def admin_broadcast(message: Message):
+    if not await admin_only(message): return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Формат: /admin_broadcast Текст сообщения")
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id FROM users WHERE active=1")
+        ids = [r[0] for r in await cur.fetchall()]
+    sent = failed = 0
+    for uid in ids:
+        try:
+            await bot.send_message(uid, "📢 <b>Сообщение администрации</b>\n\n" + parts[1], parse_mode="HTML")
+            sent += 1
+        except Exception: failed += 1
+        await asyncio.sleep(0.04)
+    await message.answer(f"Рассылка завершена. Отправлено: {sent}; не доставлено: {failed}.")
+
+
+@dp.message(Command("promo_create"))
+async def promo_create(message: Message):
+    if not await admin_only(message): return
+    parts = (message.text or "").split()
+    if len(parts) != 4 or not re.fullmatch(r"[A-Za-z0-9_-]{3,32}", parts[1]) or not parts[2].isdigit() or not parts[3].isdigit() or int(parts[2]) <= 0 or int(parts[3]) <= 0:
+        await message.answer("Формат: /promo_create КОД СУММА КОЛИЧЕСТВО_АКТИВАЦИЙ\nПример: /promo_create START100 100 50")
+        return
+    code, amount, limit = parts[1].upper(), int(parts[2]), int(parts[3])
+    async with aiosqlite.connect(DB_PATH) as db:
+        try:
+            await db.execute("INSERT INTO promos(code,amount,max_uses,created_by,created_at) VALUES(?,?,?,?,?)",
+                             (code, amount, limit, message.from_user.id, datetime.now(timezone.utc).isoformat()))
+            await db.commit()
+        except aiosqlite.IntegrityError:
+            await message.answer("Такой промокод уже существует.")
+            return
+    await message.answer(f"✅ Промокод <code>{code}</code> создан. Награда: {money(amount)} ENEX. Активаций: {limit}. Ввод: <code>/promo {code}</code>", parse_mode="HTML")
+
+
+@dp.message(Command("promo_delete"))
+async def promo_delete(message: Message):
+    if not await admin_only(message): return
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        await message.answer("Формат: /promo_delete КОД")
+        return
+    code = parts[1].upper()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM promos WHERE code=?", (code,))
+        await db.execute("DELETE FROM promo_uses WHERE code=?", (code,))
+        await db.commit()
+    await message.answer("✅ Промокод удалён." if cur.rowcount else "Промокод не найден.")
+
+
+@dp.message(Command("admin"))
+async def admin_cmd(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Нет доступа.")
+        return
+    await message.answer(
+        "🛡 <b>Администрирование ENEX</b>\n"
+        "/admin_balance ID — баланс пользователя\n"
+        "/admin_add ID СУММА — начислить ENEX\n"
+        "/admin_sub ID СУММА — списать ENEX\n"
+        "/admin_block ID — отключить/включить аккаунт",
+        parse_mode="HTML")
+
+
+@dp.message(Command("admin_balance"))
+async def admin_balance(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.answer("⛔ Нет доступа.")
+    p = (message.text or "").split()
+    if len(p) != 2 or not p[1].isdigit():
+        return await message.answer("Формат: /admin_balance ID")
+    u = await get_user(int(p[1]))
+    await message.answer(f"Баланс: {money(u['balance'])} ENEX" if u else "Пользователь не найден.")
+
+
+@dp.message(Command("admin_add"))
+@dp.message(Command("admin_sub"))
+async def admin_adjust(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.answer("⛔ Нет доступа.")
+    p = (message.text or "").split()
+    if len(p) != 3 or not p[1].isdigit() or not p[2].isdigit() or int(p[2]) <= 0:
+        return await message.answer("Формат: /admin_add ID СУММА или /admin_sub ID СУММА")
+    uid, amount = int(p[1]), int(p[2])
+    is_add = (p[0].split("@")[0] == "/admin_add")
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT balance FROM users WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+        if not row:
+            return await message.answer("Пользователь не найден. Он должен запустить бота.")
+        if not is_add and row[0] < amount:
+            return await message.answer("На балансе недостаточно средств.")
+        delta = amount if is_add else -amount
+        await db.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (delta, uid))
+        await log_tx(db, uid, "admin_add" if is_add else "admin_sub", delta,
+                     f"admin={message.from_user.id}")
+        await db.commit()
+    await message.answer("✅ Баланс обновлён.")
+
+
+@dp.message(Command("admin_block"))
+async def admin_block(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return await message.answer("⛔ Нет доступа.")
+    p = (message.text or "").split()
+    if len(p) != 2 or not p[1].isdigit():
+        return await message.answer("Формат: /admin_block ID")
+    uid = int(p[1])
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT active FROM users WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+        if not row:
+            return await message.answer("Пользователь не найден.")
+        await db.execute("UPDATE users SET active=1-active WHERE user_id=?", (uid,))
+        await db.commit()
+    await message.answer("Статус аккаунта изменён.")
+
+
+async def main():
+    global bot_username
+    if BOT_TOKEN == "PASTE_BOT_TOKEN_HERE":
+        raise RuntimeError("Set BOT_TOKEN environment variable before starting.")
+    await init_db()
+    async with Bot(BOT_TOKEN) as b:
+        me = await b.get_me()
+        bot_username = me.username or "your_bot"
+        await b.set_my_commands([
+            BotCommand(command="start", description="Главное меню ENEX"),
+            BotCommand(command="balance", description="Мой баланс"),
+            BotCommand(command="transfer", description="Перевести ENEX"),
+            BotCommand(command="check", description="Создать чек"),
+            BotCommand(command="request", description="Запросить деньги"),
+            BotCommand(command="topup", description="Пополнить за Stars"),
+            BotCommand(command="settings", description="Настройки"),
+            BotCommand(command="help", description="Помощь и команды"),
+            BotCommand(command="promo", description="Активировать промокод"),
+            BotCommand(command="admin", description="Администрирование"),
+        ])
+        logging.info("ENEX bot started as @%s", bot_username)
+        await dp.start_polling(b)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
